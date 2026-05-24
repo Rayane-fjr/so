@@ -68,6 +68,7 @@ export interface BehavioralEvent {
 // ── Defaults ─────────────────────────────────────────────────────────────────
 
 /** Returned on first launch or when bri-state.json is missing / corrupt. */
+/**This is a fallback object that consists of the same interface it was typed in (BRIState)*/
 export const DEFAULT_BRI_STATE: BRIState = {
   currentBRI: 0,
   stateLabel: 'low',

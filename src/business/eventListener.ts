@@ -11,11 +11,14 @@
 
 import * as vscode from 'vscode';
 import { BehavioralEvent } from '../types';
-import { classifyPasteEvent } from './pasteClassifier';
+import { classifyInsertedTexts, classifyPasteEvent } from './pasteClassifier';
 
 /** Maximum number of inserted-code events held in memory for undo/modification matching. */
 const RECENT_PASTE_WINDOW = 20;
 const MAX_CACHED_FILE_BYTES = 1_000_000;
+const AGENT_INSERT_BATCH_DELAY_MS = 1200;
+const AGENT_INSERT_RECLASSIFY_WINDOW_MS = 6000;
+const AGENT_INSERT_MIN_TEXT_LENGTH = 8;
 
 interface TrackedRange {
   startLine: number;
@@ -33,11 +36,23 @@ interface TrackedPaste {
   ranges: TrackedRange[];
 }
 
+interface PendingInsertBatch {
+  document: vscode.TextDocument;
+  previousDocumentText: string;
+  internalSourceTexts: readonly string[];
+  insertedTexts: string[];
+  ranges: TrackedRange[];
+  netNonEmptyLineDelta: number;
+  emittedTypingDelta: number;
+  timeout?: ReturnType<typeof setTimeout>;
+  expireTimeout?: ReturnType<typeof setTimeout>;
+}
+
 export class EventListenerModule {
   private recentPastes: TrackedPaste[] = [];
+  private pendingInsertBatches: Map<string, PendingInsertBatch> = new Map();
   private documentLineSnapshots: Map<string, string[]> = new Map();
   private workspaceTextCache: Map<string, string> = new Map();
-  private workspaceTextCacheReady = false;
   private sessionId: string = '';
 
   constructor(
@@ -90,31 +105,42 @@ export class EventListenerModule {
         internalSourceTexts
       );
       if (pasteEvent !== null) {
+        this.flushPendingInsertBatchAsTyping(documentKey, false);
+
         const currentLines = this.snapshotLines(e.document);
         this.documentLineSnapshots.set(documentKey, currentLines);
         this.workspaceTextCache.set(documentKey, e.document.getText());
 
         if (pasteEvent.isInternal) {
           console.log(`Bounded: internal insert ignored - lines: ${pasteEvent.lineCount}`);
-        } else if (!this.workspaceTextCacheReady) {
-          console.log(`Bounded: insert ignored while workspace cache is warming - lines: ${pasteEvent.lineCount}`);
         } else {
-          const ranges = e.contentChanges
-            .filter((change) => change.text.trim() !== '')
-            .map((change) => ({
-              startLine: change.range.start.line,
-              endLine: change.range.start.line + change.text.split('\n').length - 1,
-              modifiedLines: new Set<number>(),
-            }));
-
-          this.recentPastes.push({ event: pasteEvent, ranges });
-          if (this.recentPastes.length > RECENT_PASTE_WINDOW) {
-            this.recentPastes.shift();
-          }
-          setImmediate(() => this.onPasteDetected(pasteEvent));
+          this.trackInsertedEvent(pasteEvent, e.contentChanges);
         }
         return;
       }
+
+      if (
+        this.isPotentialAgentInsertEvent(e, previousLines) ||
+        (this.pendingInsertBatches.has(documentKey) && this.hasPositiveLineGrowth(e))
+      ) {
+        const currentLines = this.snapshotLines(e.document);
+        const netLineDelta =
+          this.countNonEmptyLines(currentLines) - this.countNonEmptyLines(previousLines);
+
+        this.documentLineSnapshots.set(documentKey, currentLines);
+        this.workspaceTextCache.set(documentKey, e.document.getText());
+        this.addToPendingInsertBatch(
+          documentKey,
+          e.document,
+          e.contentChanges,
+          previousDocumentText,
+          internalSourceTexts,
+          netLineDelta
+        );
+        return;
+      }
+
+      this.flushPendingInsertBatchAsTyping(documentKey, false);
 
       const consumedByUndo = new Set<number>();
 
@@ -218,9 +244,17 @@ export class EventListenerModule {
 
   public dispose(): void {
     this.recentPastes = [];
+    for (const batch of this.pendingInsertBatches.values()) {
+      if (batch.timeout !== undefined) {
+        clearTimeout(batch.timeout);
+      }
+      if (batch.expireTimeout !== undefined) {
+        clearTimeout(batch.expireTimeout);
+      }
+    }
+    this.pendingInsertBatches.clear();
     this.documentLineSnapshots.clear();
     this.workspaceTextCache.clear();
-    this.workspaceTextCacheReady = false;
   }
 
   private refreshWorkspaceTextCache(): void {
@@ -240,9 +274,8 @@ export class EventListenerModule {
           // Ignore files that disappear or cannot be decoded; the cache is best-effort.
         }
       }
-      this.workspaceTextCacheReady = true;
     }, () => {
-      this.workspaceTextCacheReady = true;
+      // The cache is best-effort; open documents and future edits still update it.
     });
   }
 
@@ -260,6 +293,262 @@ export class EventListenerModule {
 
   private countNonEmptyLines(lines: string[]): number {
     return lines.filter((line) => line.trim() !== '').length;
+  }
+
+  private countNonEmptyTextLines(text: string): number {
+    return text.split('\n').filter((line) => line.trim() !== '').length;
+  }
+
+  private isPotentialAgentInsertEvent(
+    e: vscode.TextDocumentChangeEvent,
+    previousLines: readonly string[]
+  ): boolean {
+    const insertedChanges = this.getNonEmptyInsertedChanges(e);
+    if (insertedChanges.length === 0) {
+      return false;
+    }
+
+    if (insertedChanges.length > 1) {
+      return true;
+    }
+
+    const change = insertedChanges[0];
+    if (this.countNonEmptyTextLines(change.text) > 1) {
+      return true;
+    }
+
+    return (
+      change.text.trim().length >= AGENT_INSERT_MIN_TEXT_LENGTH &&
+      (change.range.isEmpty ||
+        this.isWhitespaceOnlyRange(change, previousLines) ||
+        this.isWholeLineReplacement(change, previousLines))
+    );
+  }
+
+  private getNonEmptyInsertedChanges(
+    e: vscode.TextDocumentChangeEvent
+  ): vscode.TextDocumentContentChangeEvent[] {
+    return e.contentChanges.filter((change) => change.text.trim() !== '');
+  }
+
+  private hasPositiveLineGrowth(e: vscode.TextDocumentChangeEvent): boolean {
+    return e.contentChanges.some((change) => {
+      if (change.text.trim() === '') {
+        return false;
+      }
+
+      const addedLines = change.text.split('\n').length - 1;
+      const removedLines = change.range.end.line - change.range.start.line;
+      return addedLines - removedLines > 0;
+    });
+  }
+
+  private isWhitespaceOnlyRange(
+    change: vscode.TextDocumentContentChangeEvent,
+    previousLines: readonly string[]
+  ): boolean {
+    if (change.range.isEmpty) {
+      return true;
+    }
+
+    const startLine = change.range.start.line;
+    const endLine = change.range.end.line;
+    if (startLine === endLine) {
+      const line = previousLines[startLine] ?? '';
+      return line
+        .slice(change.range.start.character, change.range.end.character)
+        .trim() === '';
+    }
+
+    const selectedParts: string[] = [];
+    for (let line = startLine; line <= endLine; line++) {
+      const text = previousLines[line] ?? '';
+      if (line === startLine) {
+        selectedParts.push(text.slice(change.range.start.character));
+      } else if (line === endLine) {
+        selectedParts.push(text.slice(0, change.range.end.character));
+      } else {
+        selectedParts.push(text);
+      }
+    }
+
+    return selectedParts.join('\n').trim() === '';
+  }
+
+  private isWholeLineReplacement(
+    change: vscode.TextDocumentContentChangeEvent,
+    previousLines: readonly string[]
+  ): boolean {
+    if (change.range.isEmpty || change.range.start.line !== change.range.end.line) {
+      return false;
+    }
+
+    const previousLine = previousLines[change.range.start.line] ?? '';
+    return (
+      change.range.start.character === 0 &&
+      change.range.end.character >= previousLine.length &&
+      previousLine.trim() !== ''
+    );
+  }
+
+  private addToPendingInsertBatch(
+    documentKey: string,
+    document: vscode.TextDocument,
+    changes: readonly vscode.TextDocumentContentChangeEvent[],
+    previousDocumentText: string,
+    internalSourceTexts: readonly string[],
+    netNonEmptyLineDelta: number
+  ): void {
+    const existing = this.pendingInsertBatches.get(documentKey);
+    if (existing !== undefined) {
+      if (existing.timeout !== undefined) {
+        clearTimeout(existing.timeout);
+      }
+      if (existing.expireTimeout !== undefined) {
+        clearTimeout(existing.expireTimeout);
+        existing.expireTimeout = undefined;
+      }
+    }
+
+    const batch = existing ?? {
+      document,
+      previousDocumentText,
+      internalSourceTexts,
+      insertedTexts: [],
+      ranges: [],
+      netNonEmptyLineDelta: 0,
+      emittedTypingDelta: 0,
+    };
+
+    batch.insertedTexts.push(
+      ...changes
+        .map((change) => change.text)
+        .filter((text) => text.trim() !== '')
+    );
+    batch.ranges.push(...this.createTrackedRanges(changes));
+    batch.netNonEmptyLineDelta += netNonEmptyLineDelta;
+    batch.timeout = setTimeout(
+      () => this.flushPendingInsertBatchAsTyping(documentKey, true),
+      AGENT_INSERT_BATCH_DELAY_MS
+    );
+
+    this.pendingInsertBatches.set(documentKey, batch);
+    this.tryEmitPendingInsertBatch(documentKey);
+  }
+
+  private tryEmitPendingInsertBatch(documentKey: string): void {
+    const batch = this.pendingInsertBatches.get(documentKey);
+    if (batch === undefined) {
+      return;
+    }
+
+    const classification = classifyInsertedTexts(
+      batch.insertedTexts,
+      batch.document,
+      batch.previousDocumentText,
+      batch.internalSourceTexts
+    );
+    if (classification === null) {
+      return;
+    }
+
+    if (batch.timeout !== undefined) {
+      clearTimeout(batch.timeout);
+    }
+    if (batch.expireTimeout !== undefined) {
+      clearTimeout(batch.expireTimeout);
+    }
+    this.pendingInsertBatches.delete(documentKey);
+
+    if (batch.emittedTypingDelta !== 0) {
+      setImmediate(() => this.onTypingDetected(-batch.emittedTypingDelta));
+    }
+
+    const event: BehavioralEvent = {
+      eventId: `evt_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      sessionId: this.sessionId,
+      occurredAt: new Date().toISOString(),
+      eventType: 'PASTE',
+      lineCount: classification.lineCount,
+      isInternal: classification.isInternal,
+      isUndone: false,
+      modificationDepth: 0.0,
+    };
+
+    if (event.isInternal) {
+      console.log(`Bounded: internal insert ignored - lines: ${event.lineCount}`);
+      return;
+    }
+
+    this.trackInsertedEvent(event, batch.ranges);
+  }
+
+  private flushPendingInsertBatchAsTyping(
+    documentKey: string,
+    retainForReclassification: boolean
+  ): void {
+    const batch = this.pendingInsertBatches.get(documentKey);
+    if (batch === undefined) {
+      return;
+    }
+
+    if (batch.timeout !== undefined) {
+      clearTimeout(batch.timeout);
+      batch.timeout = undefined;
+    }
+    if (batch.netNonEmptyLineDelta !== 0) {
+      const typingDelta = batch.netNonEmptyLineDelta;
+      batch.emittedTypingDelta += typingDelta;
+      batch.netNonEmptyLineDelta = 0;
+      setImmediate(() => this.onTypingDetected(typingDelta));
+    }
+
+    if (!retainForReclassification) {
+      if (batch.expireTimeout !== undefined) {
+        clearTimeout(batch.expireTimeout);
+      }
+      this.pendingInsertBatches.delete(documentKey);
+      return;
+    }
+
+    if (batch.expireTimeout !== undefined) {
+      clearTimeout(batch.expireTimeout);
+    }
+    batch.expireTimeout = setTimeout(() => {
+      this.pendingInsertBatches.delete(documentKey);
+    }, AGENT_INSERT_RECLASSIFY_WINDOW_MS);
+  }
+
+  private createTrackedRanges(
+    changes: readonly vscode.TextDocumentContentChangeEvent[]
+  ): TrackedRange[] {
+    return changes
+      .filter((change) => change.text.trim() !== '')
+      .map((change) => ({
+        startLine: change.range.start.line,
+        endLine: change.range.start.line + change.text.split('\n').length - 1,
+        modifiedLines: new Set<number>(),
+      }));
+  }
+
+  private trackInsertedEvent(
+    event: BehavioralEvent,
+    changesOrRanges: readonly vscode.TextDocumentContentChangeEvent[] | readonly TrackedRange[]
+  ): void {
+    const ranges =
+      changesOrRanges.length > 0 && 'text' in changesOrRanges[0]
+        ? this.createTrackedRanges(changesOrRanges as readonly vscode.TextDocumentContentChangeEvent[])
+        : (changesOrRanges as readonly TrackedRange[]).map((range) => ({
+            startLine: range.startLine,
+            endLine: range.endLine,
+            modifiedLines: new Set<number>(range.modifiedLines),
+          }));
+
+    this.recentPastes.push({ event, ranges });
+    if (this.recentPastes.length > RECENT_PASTE_WINDOW) {
+      this.recentPastes.shift();
+    }
+    setImmediate(() => this.onPasteDetected(event));
   }
 
   private adjustRangeForWhitespaceChange(

@@ -14,6 +14,11 @@ import { BehavioralEvent } from '../types';
 /** Minimum number of inserted lines for a change to affect BRI. */
 const MIN_INSERTED_LINES = 3;
 
+interface InsertClassification {
+  lineCount: number;
+  isInternal: boolean;
+}
+
 function normalizeForInternalComparison(text: string): string {
   return text
     .replace(/\r\n/g, '\n')
@@ -28,6 +33,10 @@ function normalizeCodeBlockLines(text: string): string[] {
     .split('\n')
     .map((line) => line.trim())
     .filter((line) => line !== '');
+}
+
+function countInsertedLines(text: string): number {
+  return text.split('\n').filter((line) => line.trim() !== '').length;
 }
 
 export function containsInsertedCode(sourceText: string, insertedText: string): boolean {
@@ -97,6 +106,67 @@ function isInternalInsert(
   return false;
 }
 
+function areInsertedTextsInternal(
+  insertedTexts: readonly string[],
+  excludeDoc: vscode.TextDocument,
+  previousDocumentText?: string,
+  internalSourceTexts: readonly string[] = []
+): boolean {
+  const combinedInsertedText = insertedTexts.join('\n');
+  if (
+    isInternalInsert(
+      combinedInsertedText,
+      excludeDoc,
+      previousDocumentText,
+      internalSourceTexts
+    )
+  ) {
+    return true;
+  }
+
+  const substantialTexts = insertedTexts.filter(
+    (text) => countInsertedLines(text) >= MIN_INSERTED_LINES
+  );
+  if (substantialTexts.length === 0 || substantialTexts.length !== insertedTexts.length) {
+    return false;
+  }
+
+  return substantialTexts.every((text) =>
+    isInternalInsert(text, excludeDoc, previousDocumentText, internalSourceTexts)
+  );
+}
+
+export function classifyInsertedTexts(
+  insertedTexts: readonly string[],
+  excludeDoc: vscode.TextDocument,
+  previousDocumentText?: string,
+  internalSourceTexts: readonly string[] = []
+): InsertClassification | null {
+  const nonEmptyInsertedTexts = insertedTexts.filter((text) => text.trim() !== '');
+  if (nonEmptyInsertedTexts.length === 0) {
+    return null;
+  }
+
+  const lineCount = nonEmptyInsertedTexts.reduce(
+    (sum, text) => sum + countInsertedLines(text),
+    0
+  );
+
+  if (lineCount < MIN_INSERTED_LINES) {
+    return null;
+  }
+
+  return {
+    lineCount,
+    isInternal: areInsertedTextsInternal(
+      nonEmptyInsertedTexts,
+      excludeDoc,
+      previousDocumentText,
+      internalSourceTexts
+    ),
+  };
+}
+
 /**
  * Classifies a TextDocumentChangeEvent as a BehavioralEvent or returns null.
  *
@@ -121,18 +191,15 @@ export function classifyPasteEvent(
     return null;
   }
 
-  const lineCount = insertedTexts.reduce(
-    (sum, text) => sum + text.split('\n').filter((line) => line.trim() !== '').length,
-    0
+  const classification = classifyInsertedTexts(
+    insertedTexts,
+    change.document,
+    previousDocumentText,
+    internalSourceTexts
   );
-
-  if (lineCount < MIN_INSERTED_LINES) {
+  if (classification === null) {
     return null;
   }
-
-  const internal = insertedTexts.every((text) =>
-    isInternalInsert(text, change.document, previousDocumentText, internalSourceTexts)
-  );
 
   // Keep the historical event type for compatibility with the rest of the app.
   return {
@@ -140,8 +207,8 @@ export function classifyPasteEvent(
     sessionId,
     occurredAt: new Date().toISOString(),
     eventType: 'PASTE',
-    lineCount,
-    isInternal: internal,
+    lineCount: classification.lineCount,
+    isInternal: classification.isInternal,
     isUndone: false,
     modificationDepth: 0.0,
   };
